@@ -22,7 +22,11 @@ class Database(object):
     class __Database:
         def __init__(self):
             default_trades = {"trackedCoinPairs": [], "trades": []}
-            default_app_data = {"coinPairs": [], "pausedTrackedCoinPairs": [], "pauseTime": {"buy": None, "sell": None}}
+            default_app_data = {
+                "coinPairs": [], "pausedTrackedCoinPairs": [],
+                "pauseTime": {"buy": None, "sell": None, "balance": None},
+                "previousBalance": None
+            }
 
             self.trades_file_string = "../database/trades.json"
             self.app_data_file_string = "../database/app-data.json"
@@ -149,16 +153,32 @@ class Database(object):
 
             write_json_to_file(self.app_data_file_string, self.app_data)
 
+        def reset_balance_notifier(self, current_balance=None):
+            """
+            Used to reset the balance notifier pause time
+
+            :param current_balance: The current total balance's BTC value
+            :type current_balance: float
+            """
+            if current_balance is not None:
+                self.app_data["previousBalance"] = current_balance
+            self.app_data["pauseTime"]["balance"] = time.time()
+
+            write_json_to_file(self.app_data_file_string, self.app_data)
+
         def check_resume(self, pause_time, pause_type):
             """
-            Used to check if the pause type cen be un-paused
+            Used to check if the pause type can be un-paused
 
             :param pause_time: The amount of minutes tracking should be paused
             :type pause_time: int
-            :param pause_type: The pause type to check (one of: 'buy', 'sell')
+            :param pause_type: The pause type to check (one of: 'buy', 'sell', 'balance)
             :type pause_type: str
             """
             if self.app_data["pauseTime"][pause_type] is None:
+                if pause_type == "balance":
+                    self.reset_balance_notifier()
+                    return True
                 return False
             return time.time() - self.app_data["pauseTime"][pause_type] >= pause_time * 60
 
@@ -170,7 +190,7 @@ class Database(object):
             :type coin_pair: str
 
             :return: The open trade object
-            :rtype : dict
+            :rtype: dict
             """
             trade_index = py_.find_index(self.trades["trades"],
                                          lambda trade: trade["coinPair"] == coin_pair and "sell" not in trade)
@@ -194,7 +214,7 @@ class Database(object):
             :type trade: dict
 
             :return: Profit margin
-            :rtype : float
+            :rtype: float
             """
             if trade is None:
                 trade = self.get_open_trade(coin_pair)
@@ -205,6 +225,17 @@ class Database(object):
             profit_margin = 100 * (sell_btc_quantity - buy_btc_quantity) / buy_btc_quantity
 
             return profit_margin
+
+        def get_previous_total_balance(self):
+            """
+            Used to get the previous total balance
+
+            :return: Previous total balance
+            :rtype: float
+            """
+            if "previousBalance" not in self.app_data or self.app_data["previousBalance"] == 0:
+                return None
+            return self.app_data["previousBalance"]
 
         @staticmethod
         def convert_bittrex_order_object(bittrex_order, stats=None):

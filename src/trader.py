@@ -12,12 +12,12 @@ class Trader(object):
     Used for handling all trade functionality
     """
 
-    def __init__(self, secrets):
-        self.trade_params = secrets["tradeParameters"]
-        self.pause_params = secrets["pauseParameters"]
+    def __init__(self, secrets, settings):
+        self.trade_params = settings["tradeParameters"]
+        self.pause_params = settings["pauseParameters"]
 
         self.Bittrex = Bittrex(secrets)
-        self.Messenger = Messenger(secrets)
+        self.Messenger = Messenger(secrets, settings)
         self.Database = Database()
 
     def initialise(self):
@@ -29,20 +29,25 @@ class Trader(object):
                 self.Database.store_coin_pairs(self.get_markets("BTC"))
             self.Messenger.print_header(len(self.Database.app_data["coinPairs"]))
         except ConnectionError as exception:
-            self.Messenger.print_exception_error("connection")
+            self.Messenger.print_error("connection", [], True)
             logger.exception(exception)
             exit()
 
     def analyse_pauses(self):
         """
-        Check all the paused buy and sell pairs and reactivate the necessary ones
+        Checks all the paused buy and sell pairs and the balance notification timer and reactivate the necessary ones
         """
         if self.Database.check_resume(self.pause_params["buy"]["pauseTime"], "buy"):
             self.Database.store_coin_pairs(self.get_markets("BTC"))
             self.Messenger.print_resume_pause(len(self.Database.app_data["coinPairs"]), "buy")
-        if self.Database.check_resume(self.pause_params["sell"]["pauseTime"], "sell"):
+        if "sell" in self.pause_params and self.Database.check_resume(self.pause_params["sell"]["pauseTime"], "sell"):
             self.Messenger.print_resume_pause(self.Database.app_data["pausedTrackedCoinPairs"], "sell")
             self.Database.resume_sells()
+        if "balance" in self.pause_params and self.Database.check_resume(self.pause_params["balance"]["pauseTime"],
+                                                                         "balance"):
+            current_balance = self.Messenger.send_balance_slack(self.get_non_zero_balances(),
+                                                                self.Database.get_previous_total_balance())
+            self.Database.reset_balance_notifier(current_balance)
 
     def analyse_buys(self):
         """
@@ -76,17 +81,20 @@ class Trader(object):
         day_volume = self.get_current_24hr_volume(coin_pair)
         current_buy_price = self.get_current_price(coin_pair, "ask")
 
+        if rsi is None:
+            return
+
         if self.check_buy_parameters(rsi, day_volume, current_buy_price):
             buy_stats = {
                 "rsi": rsi,
                 "24HrVolume": day_volume
             }
             self.buy(coin_pair, self.trade_params["buy"]["btcAmount"], current_buy_price, buy_stats)
-        elif rsi is not None and rsi <= self.pause_params["buy"]["rsiThreshold"]:
-            self.Messenger.print_no_buy(coin_pair, rsi, day_volume, current_buy_price)
-        elif rsi is not None:
-            self.Messenger.print_pause(coin_pair, rsi, self.pause_params["buy"]["pauseTime"], "buy")
+        elif "buy" in self.pause_params and rsi >= self.pause_params["buy"]["rsiThreshold"] > 0:
+            self.Messenger.print_pause(coin_pair, [rsi, day_volume], self.pause_params["buy"]["pauseTime"], "buy")
             self.Database.pause_buy(coin_pair)
+        else:
+            self.Messenger.print_no_buy(coin_pair, rsi, day_volume, current_buy_price)
 
     def sell_strategy(self, coin_pair):
         """
@@ -102,17 +110,20 @@ class Trader(object):
         current_sell_price = self.get_current_price(coin_pair, "bid")
         profit_margin = self.Database.get_profit_margin(coin_pair, current_sell_price)
 
+        if rsi is None:
+            return
+
         if self.check_sell_parameters(rsi, profit_margin):
             sell_stats = {
                 "rsi": rsi,
                 "profitMargin": profit_margin
             }
             self.sell(coin_pair, current_sell_price, sell_stats)
-        elif rsi is not None and profit_margin >= self.pause_params["sell"]["profitMarginThreshold"]:
-            self.Messenger.print_no_sell(coin_pair, rsi, profit_margin, current_sell_price)
-        elif rsi is not None:
-            self.Messenger.print_pause(coin_pair, profit_margin, self.pause_params["sell"]["pauseTime"], "sell")
+        elif "sell" in self.pause_params and profit_margin <= self.pause_params["sell"]["profitMarginThreshold"] < 0:
+            self.Messenger.print_pause(coin_pair, [profit_margin, rsi], self.pause_params["sell"]["pauseTime"], "sell")
             self.Database.pause_sell(coin_pair)
+        else:
+            self.Messenger.print_no_sell(coin_pair, rsi, profit_margin, current_sell_price)
 
     def check_buy_parameters(self, rsi, day_volume, current_buy_price):
         """
@@ -126,11 +137,13 @@ class Trader(object):
         :type current_buy_price: float
 
         :return: Boolean indicating if the buy conditions have been met
-        :rtype : bool
+        :rtype: bool
         """
-        return (rsi is not None and rsi <= self.trade_params["buy"]["rsiThreshold"] and
-                day_volume >= self.trade_params["buy"]["24HourVolumeThreshold"] and
-                current_buy_price > self.trade_params["buy"]["minimumUnitPrice"])
+        rsi_check = rsi <= self.trade_params["buy"]["rsiThreshold"]
+        day_volume_check = day_volume >= self.trade_params["buy"]["24HourVolumeThreshold"]
+        current_buy_price_check = current_buy_price >= self.trade_params["buy"]["minimumUnitPrice"]
+
+        return rsi_check and day_volume_check and current_buy_price_check
 
     def check_sell_parameters(self, rsi, profit_margin):
         """
@@ -142,11 +155,15 @@ class Trader(object):
         :type profit_margin: float
 
         :return: Boolean indicating if the sell conditions have been met
-        :rtype : bool
+        :rtype: bool
         """
-        return ((rsi is not None and rsi >= self.trade_params["sell"]["rsiThreshold"] and
-                 profit_margin > self.trade_params["sell"]["minProfitMarginThreshold"]) or
-                profit_margin > self.trade_params["sell"]["profitMarginThreshold"])
+        rsi_check = rsi >= self.trade_params["sell"]["rsiThreshold"]
+        lower_profit_check = profit_margin >= self.trade_params["sell"]["minProfitMarginThreshold"]
+        upper_profit_check = profit_margin >= self.trade_params["sell"]["profitMarginThreshold"]
+        loss_check = ("lossMarginThreshold" in self.trade_params["sell"] and
+                      0 > self.trade_params["sell"]["lossMarginThreshold"] >= profit_margin)
+
+        return (rsi_check and lower_profit_check) or upper_profit_check or (rsi_check and loss_check)
 
     def buy(self, coin_pair, btc_quantity, price, stats, trade_time_limit=2):
         """
@@ -167,7 +184,9 @@ class Trader(object):
         buy_quantity = round(btc_quantity / price, 8)
         buy_data = self.Bittrex.buy_limit(coin_pair, buy_quantity, price)
         if not buy_data["success"]:
-            return logger.error("Failed to buy on {} market.".format(coin_pair))
+            error_str = self.Messenger.print_error("buy", [coin_pair, buy_data["message"]])
+            logger.error(error_str)
+            return
         self.Database.store_initial_buy(coin_pair, buy_data["result"]["uuid"])
 
         buy_order_data = self.get_order(buy_data["result"]["uuid"], trade_time_limit * 60)
@@ -195,9 +214,9 @@ class Trader(object):
         trade = self.Database.get_open_trade(coin_pair)
         sell_data = self.Bittrex.sell_limit(coin_pair, trade["quantity"], price)
         if not sell_data["success"]:
-            return logger.error(
-                "Failed to sell on {} market. Bittrex error message: {}".format(coin_pair, sell_data["message"])
-            )
+            error_str = self.Messenger.print_error("sell", [coin_pair, sell_data["message"]])
+            logger.error(error_str)
+            return
 
         sell_order_data = self.get_order(sell_data["result"]["uuid"], trade_time_limit * 60)
         # TODO: Handle partial/incomplete sales.
@@ -216,11 +235,12 @@ class Trader(object):
         :type main_market_filter: str
 
         :return: All Bittrex markets (with filter applied, if any)
-        :rtype : list
+        :rtype: list
         """
         markets = self.Bittrex.get_markets()
         if not markets["success"]:
-            logger.error("Failed to fetch Bittrex markets")
+            error_str = self.Messenger.print_error("market", [], True)
+            logger.error(error_str)
             exit()
 
         markets = markets["result"]
@@ -240,11 +260,12 @@ class Trader(object):
         :type price_type: str
 
         :return: Coin pair's current market price
-        :rtype : float
+        :rtype: float
         """
         coin_summary = self.Bittrex.get_market_summary(coin_pair)
         if not coin_summary["success"]:
-            logger.error("Failed to fetch Bittrex market summary for the {} market".format(coin_pair))
+            error_str = self.Messenger.print_error("coinMarket", [coin_pair])
+            logger.error(error_str)
             return None
         if price_type == "ask":
             return coin_summary["result"][0]["Ask"]
@@ -260,11 +281,12 @@ class Trader(object):
         :type coin_pair: str
 
         :return: Coin pair's current 24 hour market volume
-        :rtype : float
+        :rtype: float
         """
         coin_summary = self.Bittrex.get_market_summary(coin_pair)
         if not coin_summary["success"]:
-            logger.error("Failed to fetch Bittrex market summary for the {} market".format(coin_pair))
+            error_str = self.Messenger.print_error("coinMarket", [coin_pair])
+            logger.error(error_str)
             return None
         return coin_summary["result"][0]["BaseVolume"]
 
@@ -280,7 +302,7 @@ class Trader(object):
         :type unit: str
 
         :return: Array of closing prices
-        :rtype : list
+        :rtype: list
         """
         historical_data = self.Bittrex.get_historical_data(coin_pair, period, unit)
         closing_prices = []
@@ -300,7 +322,7 @@ class Trader(object):
         :type trade_time_limit: float
 
         :return: Order object
-        :rtype : dict
+        :rtype: dict
         """
         start_time = time.time()
         order_data = self.Bittrex.get_order(order_uuid)
@@ -309,11 +331,12 @@ class Trader(object):
             order_data = self.Bittrex.get_order(order_uuid)
 
         if order_data["result"]["IsOpen"]:
-            error_str = self.Messenger.print_order_error(order_uuid, trade_time_limit, order_data["result"]["Exchange"])
+            error_str = self.Messenger.print_error(
+                "order", [order_uuid, trade_time_limit, order_data["result"]["Exchange"]]
+            )
             logger.error(error_str)
             if order_data["result"]["Type"] == "LIMIT_BUY":
                 self.Bittrex.cancel(order_uuid)
-            return order_data
 
         return order_data
 
@@ -331,7 +354,7 @@ class Trader(object):
         :type unit: str
 
         :return: RSI
-        :rtype : float
+        :rtype: float
         """
         closing_prices = self.get_closing_prices(coin_pair, period * 3, unit)
         count = 0
@@ -375,3 +398,40 @@ class Trader(object):
         rs = new_avg_gain / new_avg_loss
         new_rs = 100 - 100 / (1 + rs)
         return new_rs
+
+    def get_non_zero_balances(self):
+        """
+        Gets all non-zero user coin balances in the correct format
+        """
+        balances_data = self.Bittrex.get_balances()
+        if not balances_data["success"]:
+            error_str = self.Messenger.print_error("balance")
+            logger.error(error_str)
+            return
+        non_zero_balances = py_.filter_(balances_data["result"], lambda balance_item: balance_item["Balance"] > 0)
+        return py_.map_(non_zero_balances, lambda balance: self.create_balance_object(balance))
+
+    def create_balance_object(self, balance_item):
+        """
+        Creates a new balance object containing only the relevant values and the BTC value of the coin's balance
+
+        :param balance_item: The Bittrex user balance object for a coin
+        :type balance_item: dict
+        """
+        btc_price = 1
+        is_tracked = False
+        if balance_item["Currency"] != "BTC":
+            coin_pair = "BTC-" + balance_item["Currency"]
+            is_tracked = coin_pair in self.Database.trades["trackedCoinPairs"]
+            btc_price = self.get_current_price(coin_pair, "bid")
+
+        try:
+            btc_value = round(btc_price * balance_item["Balance"], 8)
+        except TypeError as exception:
+            logger.exception(exception)
+            btc_value = 0
+
+        return py_.assign(
+            py_.pick(balance_item, "Currency", "Balance"),
+            {"BtcValue": btc_value, "IsTracked": is_tracked}
+        )
